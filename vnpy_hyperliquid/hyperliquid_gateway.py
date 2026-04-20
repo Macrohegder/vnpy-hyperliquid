@@ -182,6 +182,11 @@ class HyperliquidGateway(BaseGateway):
         self.name_to_coin: dict[str, str] = {}
         self.asset_to_name: dict[int, str] = {}
 
+        # Perp dex support
+        self.perp_dexs: list[str] = []
+        self.perp_dex_to_offset: dict[str, int] = {}
+        self.name_to_dex: dict[str, str] = {}
+
         self.rest_api: RestApi = RestApi(self)
         self.ws_api: WsApi = WsApi(self)
 
@@ -358,6 +363,9 @@ class RestApi(RestClient):
         self.connect_time: int = 0
         self.reqid_order_map: dict[int, OrderData] = {}
 
+        self._pending_dex_count: int = 0
+        self._dex_contracts_ready: int = 0
+
     def connect(
         self,
         wallet: LocalAccount,
@@ -421,43 +429,52 @@ class RestApi(RestClient):
         self.add_request(
             method="POST",
             path="/info",
-            data=json.dumps({"type": "metaAndAssetCtxs"}),
+            data=json.dumps({"type": "perpDexs"}),
             headers={"Content-Type": "application/json"},
-            callback=self.on_query_contract,
+            callback=self.on_query_perp_dexs,
         )
 
     def query_account(self) -> None:
         if not self.wallet:
             return
-        self.add_request(
-            method="POST",
-            path="/info",
-            data=json.dumps({"type": "clearinghouseState", "user": self.wallet.address}),
-            headers={"Content-Type": "application/json"},
-            callback=self.on_query_account,
-        )
+        # Query account for each dex
+        for dex_name in self.gateway.perp_dexs:
+            self.add_request(
+                method="POST",
+                path="/info",
+                data=json.dumps({"type": "clearinghouseState", "user": self.wallet.address, "dex": dex_name}),
+                headers={"Content-Type": "application/json"},
+                callback=self.on_query_account,
+                extra=dex_name,
+            )
 
     def query_position(self) -> None:
         if not self.wallet:
             return
-        self.add_request(
-            method="POST",
-            path="/info",
-            data=json.dumps({"type": "clearinghouseState", "user": self.wallet.address}),
-            headers={"Content-Type": "application/json"},
-            callback=self.on_query_position,
-        )
+        # Query position for each dex
+        for dex_name in self.gateway.perp_dexs:
+            self.add_request(
+                method="POST",
+                path="/info",
+                data=json.dumps({"type": "clearinghouseState", "user": self.wallet.address, "dex": dex_name}),
+                headers={"Content-Type": "application/json"},
+                callback=self.on_query_position,
+                extra=dex_name,
+            )
 
     def query_order(self) -> None:
         if not self.wallet:
             return
-        self.add_request(
-            method="POST",
-            path="/info",
-            data=json.dumps({"type": "openOrders", "user": self.wallet.address}),
-            headers={"Content-Type": "application/json"},
-            callback=self.on_query_order,
-        )
+        # Query open orders for each dex
+        for dex_name in self.gateway.perp_dexs:
+            self.add_request(
+                method="POST",
+                path="/info",
+                data=json.dumps({"type": "openOrders", "user": self.wallet.address, "dex": dex_name}),
+                headers={"Content-Type": "application/json"},
+                callback=self.on_query_order,
+                extra=dex_name,
+            )
 
     def send_order(self, req: OrderRequest, contract: ContractData) -> str:
         if not self.wallet:
@@ -475,7 +492,8 @@ class RestApi(RestClient):
         sz_decimals: int = self.gateway.asset_to_sz_decimals.get(asset, 0)
 
         # Round price
-        is_spot = asset >= 10000
+        # Spot assets are in range [10000, 110000), perp dex assets start at 110000
+        is_spot = 10000 <= asset < 110000
         limit_px = round_hyperliquid_price(req.price, sz_decimals, is_spot)
 
         # Generate cloid for order tracking
@@ -632,38 +650,78 @@ class RestApi(RestClient):
         index.sort()
         return [buf[i] for i in index]
 
-    def on_query_contract(self, packet: dict, request: Request) -> None:
-        """Callback of contract query."""
-        if not isinstance(packet, list) or len(packet) < 2:
-            self.gateway.write_log("Invalid contract response")
+    def on_query_perp_dexs(self, packet: dict, request: Request) -> None:
+        """Callback of perpDexs query, then query metaAndAssetCtxs for each dex."""
+        if not isinstance(packet, list):
+            self.gateway.write_log("Invalid perpDexs response")
             return
 
+        self.gateway.perp_dexs = []
+        self.gateway.perp_dex_to_offset = {"": 0}
+
+        # packet[0] is None for standard dex, then builder dexs
+        for i, dex_info in enumerate(packet):
+            if dex_info is None:
+                dex_name = ""
+            else:
+                dex_name = dex_info.get("name", "")
+                if dex_name and dex_name not in self.gateway.perp_dex_to_offset:
+                    # builder-deployed perp dexs start at 110000, offset by 10000 each
+                    self.gateway.perp_dex_to_offset[dex_name] = 110000 + (i - 1) * 10000
+            self.gateway.perp_dexs.append(dex_name)
+
+        self.gateway.write_log(f"Found perp dexs: {self.gateway.perp_dexs}")
+
+        # Query metaAndAssetCtxs for each dex
+        for dex_name in self.gateway.perp_dexs:
+            self.add_request(
+                method="POST",
+                path="/info",
+                data=json.dumps({"type": "metaAndAssetCtxs", "dex": dex_name}),
+                headers={"Content-Type": "application/json"},
+                callback=self.on_query_contract,
+                extra=dex_name,
+            )
+
+        # Track how many dexs we're waiting for
+        self._pending_dex_count = len(self.gateway.perp_dexs)
+        self._dex_contracts_ready = 0
+
+    def on_query_contract(self, packet: dict, request: Request) -> None:
+        """Callback of contract query for a specific dex."""
+        if not isinstance(packet, list) or len(packet) < 2:
+            self.gateway.write_log("Invalid contract response")
+            self._dex_contracts_ready += 1
+            self._check_all_contracts_ready()
+            return
+
+        dex_name: str = request.extra or ""
         meta = packet[0]
         asset_ctxs = packet[1]
+        offset = self.gateway.perp_dex_to_offset.get(dex_name, 0)
 
-        self.gateway.meta = meta
-        self.gateway.margin_tables = meta.get("marginTables", [])
-        self.gateway.collateral_token = meta.get("collateralToken", {})
+        universe = meta.get("universe", [])
+        self.gateway.write_log(f"Contract query for dex='{dex_name}', count: {len(universe)}, offset: {offset}")
 
-        # Build mappings
-        for idx, asset_info in enumerate(meta.get("universe", [])):
-            name = asset_info["name"]
-            sz_decimals = asset_info["szDecimals"]
-            self.gateway.asset_to_sz_decimals[idx] = sz_decimals
-            self.gateway.name_to_asset[name] = idx
-            self.gateway.name_to_coin[name] = name
-            self.gateway.asset_to_name[idx] = name
-
-        # Create contract data
-        for idx, asset_info in enumerate(meta.get("universe", [])):
+        # Build mappings and create contract data
+        for idx, asset_info in enumerate(universe):
             name = asset_info["name"]
             sz_decimals = asset_info["szDecimals"]
             max_leverage = asset_info.get("maxLeverage", 1)
+            global_asset = idx + offset
+
+            self.gateway.asset_to_sz_decimals[global_asset] = sz_decimals
+            self.gateway.name_to_asset[name] = global_asset
+            self.gateway.name_to_coin[name] = name
+            self.gateway.asset_to_name[global_asset] = name
+            self.gateway.name_to_dex[name] = dex_name
 
             pricetick = 10 ** -(6 - sz_decimals)
             min_volume = 10 ** -sz_decimals
 
-            symbol: str = f"{name}_SWAP_HL"
+            # Generate symbol: replace ':' with '_' and uppercase
+            symbol_name = name.replace(":", "_").upper()
+            symbol: str = f"{symbol_name}_SWAP_HL"
 
             contract: ContractData = ContractData(
                 symbol=symbol,
@@ -678,15 +736,22 @@ class RestApi(RestClient):
                 gateway_name=self.gateway_name,
             )
             contract.extra = asset_info
+            contract.extra["dex"] = dex_name
+            contract.extra["asset"] = global_asset
 
             self.gateway.on_contract(contract)
 
-        self.gateway.write_log(f"Contract query complete, total: {len(meta.get('universe', []))}")
+        self._dex_contracts_ready += 1
+        self._check_all_contracts_ready()
 
-        # After contract query, connect WS, query account and active orders
-        self.gateway.connect_ws_api()
-        self.query_account()
-        self.query_order()
+    def _check_all_contracts_ready(self) -> None:
+        """Check if all dex contract queries are complete."""
+        if self._dex_contracts_ready >= self._pending_dex_count:
+            total_contracts = len(self.gateway.symbol_contract_map)
+            self.gateway.write_log(f"All contract queries complete, total contracts: {total_contracts}")
+            self.gateway.connect_ws_api()
+            self.query_account()
+            self.query_order()
 
     def on_query_account(self, packet: dict, request: Request) -> None:
         """Callback of account query."""
