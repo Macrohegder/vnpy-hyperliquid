@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vnpy-hyperliquid"
+version = "2026.04.20"
+description = "Hyperliquid gateway for VeighNa trading framework"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "QuantDev"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+    "vnpy>=3.9.0",
+    "vnpy_rest>=1.2.0",
+    "vnpy_websocket>=1.1.0",
+    "hyperliquid-python-sdk>=0.10.0",
+    "eth-account>=0.13.0",
+    "msgpack>=1.0.0",
+    "eth-utils>=5.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/raymond-hsiao/vnpy-hyperliquid"
+Issues = "https://github.com/raymond-hsiao/vnpy-hyperliquid/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vnpy_hyperliquid*"]
+
+[tool.setuptools.package-data]
+vnpy_hyperliquid = ["*.py", "py.typed"]
