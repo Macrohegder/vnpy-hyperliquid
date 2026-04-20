@@ -720,7 +720,10 @@ class RestApi(RestClient):
             min_volume = 10 ** -sz_decimals
 
             # Generate symbol: replace ':' with '_' and uppercase
+            # Standard dex coins use {COIN}USDC_SWAP_HL to align with data-platform naming
             symbol_name = name.replace(":", "_").upper()
+            if ":" not in name:
+                symbol_name += "USDC"
             symbol: str = f"{symbol_name}_SWAP_HL"
 
             contract: ContractData = ContractData(
