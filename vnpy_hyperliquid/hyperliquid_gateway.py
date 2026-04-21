@@ -962,6 +962,7 @@ class WsApi(WebsocketClient):
 
     def on_disconnected(self, status_code: int, msg: str) -> None:
         self.gateway.write_log("WebSocket API disconnected")
+        self.wsapp = None
 
     def on_packet(self, packet: dict) -> None:
         channel = packet.get("channel", "")
@@ -1272,4 +1273,9 @@ class WsApi(WebsocketClient):
         )
 
     def send_ping(self) -> None:
-        self.send_packet({"method": "ping"})
+        if not self.active or not self.wsapp:
+            return
+        try:
+            self.send_packet({"method": "ping"})
+        except Exception:
+            pass
