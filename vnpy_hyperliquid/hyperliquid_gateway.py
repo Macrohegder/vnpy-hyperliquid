@@ -345,6 +345,12 @@ class HyperliquidGateway(BaseGateway):
         if self.ping_count < self.ping_interval:
             return
         self.ping_count = 0
+
+        if not self.ws_api.connected:
+            self.write_log("WebSocket API disconnected, reconnecting...")
+            self.ws_api.connect(self.proxy_host, self.proxy_port)
+            return
+
         self.ws_api.send_ping()
 
 
@@ -904,6 +910,7 @@ class WsApi(WebsocketClient):
         self.gateway: HyperliquidGateway = gateway
         self.gateway_name: str = gateway.gateway_name
 
+        self.connected: bool = False
         self.ticks: dict[str, TickData] = {}
         self.subscribed: dict[str, SubscribeRequest] = {}
 
@@ -943,6 +950,7 @@ class WsApi(WebsocketClient):
         })
 
     def on_connected(self) -> None:
+        self.connected = True
         self.gateway.write_log("WebSocket API connected")
 
         # Subscribe to user events
@@ -969,8 +977,8 @@ class WsApi(WebsocketClient):
         self.gateway.rest_api.query_position()
 
     def on_disconnected(self, status_code: int, msg: str) -> None:
+        self.connected = False
         self.gateway.write_log("WebSocket API disconnected")
-        self.wsapp = None
 
     def on_packet(self, packet: dict) -> None:
         channel = packet.get("channel", "")
@@ -1281,9 +1289,8 @@ class WsApi(WebsocketClient):
         )
 
     def send_ping(self) -> None:
-        if not self.active or not self.wsapp:
-            return
-        try:
-            self.send_packet({"method": "ping"})
-        except Exception:
-            pass
+        if self.connected:
+            try:
+                self.send_packet({"method": "ping"})
+            except Exception:
+                pass
