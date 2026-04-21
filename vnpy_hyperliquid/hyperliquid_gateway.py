@@ -395,6 +395,11 @@ class RestApi(RestClient):
         msg: str = f"REST API exception: {detail}"
         self.gateway.write_log(msg)
 
+    def on_failed(self, status_code: int, request: Request) -> None:
+        """Callback for failed REST API requests."""
+        msg: str = f"REST API request failed: {status_code} {request.method} {request.path}, data={request.data}"
+        self.gateway.write_log(msg)
+
     def sign_action(self, action: dict, nonce: int) -> dict:
         """Sign action with wallet."""
         if not self.wallet:
@@ -761,17 +766,20 @@ class RestApi(RestClient):
         if not isinstance(packet, dict):
             return
 
-        margin_summary = packet.get("marginSummary", {})
-        withdrawable = packet.get("withdrawable", "0")
+        dex_name: str = request.extra or ""
+        margin_summary = packet.get("marginSummary") or {}
+        withdrawable = packet.get("withdrawable", "0") or "0"
 
+        accountid: str = "USDC" if not dex_name else f"USDC_{dex_name.upper()}"
         account: AccountData = AccountData(
-            accountid="USDC",
+            accountid=accountid,
             balance=get_float_value(margin_summary, "accountValue"),
             gateway_name=self.gateway_name,
         )
         account.available = float(withdrawable)
         account.frozen = account.balance - account.available
 
+        self.gateway.write_log(f"Account query [{dex_name or 'default'}]: balance={account.balance}, available={account.available}")
         self.gateway.on_account(account)
 
     def on_query_position(self, packet: dict, request: Request) -> None:
@@ -779,7 +787,7 @@ class RestApi(RestClient):
         if not isinstance(packet, dict):
             return
 
-        asset_positions = packet.get("assetPositions", [])
+        asset_positions = packet.get("assetPositions") or []
         for ap in asset_positions:
             pos = ap.get("position", {})
             name = pos.get("coin", "")
@@ -1112,8 +1120,8 @@ class WsApi(WebsocketClient):
 
     def process_clearinghouse_state(self, data: dict) -> None:
         """Process clearinghouse state update from userEvents."""
-        margin_summary = data.get("marginSummary", {})
-        withdrawable = data.get("withdrawable", "0")
+        margin_summary = data.get("marginSummary") or {}
+        withdrawable = data.get("withdrawable", "0") or "0"
 
         account: AccountData = AccountData(
             accountid="USDC",
@@ -1125,7 +1133,7 @@ class WsApi(WebsocketClient):
         self.gateway.on_account(account)
 
         # Process positions
-        asset_positions = data.get("assetPositions", [])
+        asset_positions = data.get("assetPositions") or []
         for ap in asset_positions:
             pos = ap.get("position", {})
             name = pos.get("coin", "")
