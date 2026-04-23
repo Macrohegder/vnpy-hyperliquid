@@ -919,8 +919,21 @@ class WsApi(WebsocketClient):
         proxy_host: str,
         proxy_port: int,
     ) -> None:
+        """Connect to WebSocket with safe cleanup of existing connection."""
+        # If there's an existing thread running, stop it first to avoid leaks
+        if self.thread and self.thread.is_alive():
+            self.stop()
+            # Wait briefly for the old thread to finish
+            self.thread.join(timeout=2)
+
         self.init(WS_HOST, proxy_host, proxy_port)
         self.start()
+
+    def on_error(self, e: Exception) -> None:
+        """Callback when websocket error occurs — mark as disconnected so
+        process_timer_event can trigger a reconnect."""
+        self.connected = False
+        self.gateway.write_log(f"WebSocket API error: {e}")
 
     def subscribe(self, req: SubscribeRequest) -> None:
         contract: ContractData = cast(ContractData, self.gateway.get_contract_by_symbol(req.symbol))
