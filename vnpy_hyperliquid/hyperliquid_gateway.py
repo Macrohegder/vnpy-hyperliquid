@@ -147,6 +147,12 @@ class HyperliquidGateway(BaseGateway):
         "Private Key": "",
         "Proxy Host": "",
         "Proxy Port": 0,
+        # DEX/account filtering (builder-deployed perp dexs)
+        # - "default" represents the standard Hyperliquid perp dex (dex="")
+        # - empty string means "no filter" (load all dexs)
+        "Perp Dex Include": "",   # e.g. "default,xyz"
+        "Perp Dex Exclude": "",   # e.g. "abc,test"
+        "Perp Dex Regex": "",     # e.g. "^(default|prod_.*)$"
     }
 
     exchanges: list[Exchange] = [Exchange.GLOBAL]
@@ -195,10 +201,78 @@ class HyperliquidGateway(BaseGateway):
 
         self.subscribed_symbols: set[str] = set()
 
+        # DEX filtering
+        self.perp_dex_include: set[str] = set()
+        self.perp_dex_exclude: set[str] = set()
+        self.perp_dex_regex: str = ""
+        self._perp_dex_regex_compiled = None
+
+        # WS keepalive/restart
+        self.ws_heartbeat_timeout: int = 60          # seconds without any packet => restart
+        self.ws_reconnect_min_delay: int = 3         # seconds
+        self.ws_reconnect_max_delay: int = 60        # seconds
+        self._ws_next_restart_ts: float = 0.0
+        self._ws_restart_delay: int = self.ws_reconnect_min_delay
+
+    @staticmethod
+    def _normalize_dex_label(dex_name: str) -> str:
+        """Normalize dex name for filtering. default dex uses empty string in API."""
+        return (dex_name or "default").strip().lower()
+
+    def _load_dex_filter_setting(self, setting: dict) -> None:
+        """Parse dex include/exclude/regex from gateway setting."""
+        include_raw: str = (setting.get("Perp Dex Include") or "").strip()
+        exclude_raw: str = (setting.get("Perp Dex Exclude") or "").strip()
+        regex_raw: str = (setting.get("Perp Dex Regex") or "").strip()
+
+        def split_list(text: str) -> set[str]:
+            if not text:
+                return set()
+            parts = []
+            for p in text.replace(";", ",").split(","):
+                p = p.strip()
+                if p:
+                    parts.append(p)
+            return {self._normalize_dex_label(p if p.lower() != "default" else "") for p in parts}
+
+        self.perp_dex_include = split_list(include_raw)
+        self.perp_dex_exclude = split_list(exclude_raw)
+        self.perp_dex_regex = regex_raw
+        self._perp_dex_regex_compiled = None
+
+        if regex_raw:
+            try:
+                import re
+                self._perp_dex_regex_compiled = re.compile(regex_raw, re.IGNORECASE)
+            except Exception as e:
+                self.write_log(f"Invalid Perp Dex Regex='{regex_raw}', ignored: {e}")
+                self.perp_dex_regex = ""
+
+        if self.perp_dex_include or self.perp_dex_exclude or self.perp_dex_regex:
+            self.write_log(
+                "Perp dex filter enabled: "
+                f"include={sorted(self.perp_dex_include) if self.perp_dex_include else 'ALL'}, "
+                f"exclude={sorted(self.perp_dex_exclude) if self.perp_dex_exclude else 'NONE'}, "
+                f"regex={self.perp_dex_regex or 'NONE'}"
+            )
+
+    def is_dex_enabled(self, dex_name: str) -> bool:
+        """Return whether a given perp dex (builder dex) should be loaded."""
+        label: str = self._normalize_dex_label(dex_name)
+
+        if self.perp_dex_include and label not in self.perp_dex_include:
+            return False
+        if self.perp_dex_exclude and label in self.perp_dex_exclude:
+            return False
+        if self._perp_dex_regex_compiled and not self._perp_dex_regex_compiled.search(label):
+            return False
+        return True
+
     def connect(self, setting: dict) -> None:
         self.private_key = setting["Private Key"]
         self.proxy_host = setting["Proxy Host"]
         self.proxy_port = setting["Proxy Port"]
+        self._load_dex_filter_setting(setting)
 
         # Init wallet
         try:
@@ -341,6 +415,34 @@ class HyperliquidGateway(BaseGateway):
         return Cloid.from_int(unique_int).to_raw()
 
     def process_timer_event(self, event: Event) -> None:
+        # Heartbeat watchdog: if WS is stalled (no packets) or disconnected, restart with backoff
+        now: float = time.time()
+        ws_last_recv: float = getattr(self.ws_api, "last_recv_ts", 0.0) or 0.0
+        ws_disconnected: bool = bool(getattr(self.ws_api, "disconnected", False))
+
+        need_restart: bool = False
+        reason: str = ""
+        if ws_disconnected:
+            need_restart = True
+            reason = "disconnected"
+        elif ws_last_recv and (now - ws_last_recv) > self.ws_heartbeat_timeout:
+            need_restart = True
+            reason = f"no packets for {int(now - ws_last_recv)}s"
+
+        if need_restart and now >= self._ws_next_restart_ts:
+            ok = self.ws_api.restart()
+            if ok:
+                self.write_log(f"WebSocket restarted ({reason})")
+                self._ws_restart_delay = self.ws_reconnect_min_delay
+                self._ws_next_restart_ts = 0.0
+            else:
+                # Exponential backoff
+                self._ws_next_restart_ts = now + self._ws_restart_delay
+                self._ws_restart_delay = min(self._ws_restart_delay * 2, self.ws_reconnect_max_delay)
+                self.write_log(
+                    f"WebSocket restart deferred ({reason}), next try in {self._ws_restart_delay}s"
+                )
+
         self.ping_count += 1
         if self.ping_count < self.ping_interval:
             return
@@ -549,7 +651,7 @@ class RestApi(RestClient):
             extra=orderid,
         )
 
-        return orderid
+        return order.vt_orderid
 
     def cancel_order(self, req: CancelRequest, contract: ContractData) -> None:
         if not self.wallet:
@@ -662,7 +764,7 @@ class RestApi(RestClient):
             return
 
         self.gateway.perp_dexs = []
-        self.gateway.perp_dex_to_offset = {"": 0}
+        self.gateway.perp_dex_to_offset = {}
 
         # packet[0] is None for standard dex, then builder dexs
         for i, dex_info in enumerate(packet):
@@ -670,10 +772,24 @@ class RestApi(RestClient):
                 dex_name = ""
             else:
                 dex_name = dex_info.get("name", "")
-                if dex_name and dex_name not in self.gateway.perp_dex_to_offset:
-                    # builder-deployed perp dexs start at 110000, offset by 10000 each
-                    self.gateway.perp_dex_to_offset[dex_name] = 110000 + (i - 1) * 10000
+
+            # Apply filtering (keep original index i for correct offset)
+            if not self.gateway.is_dex_enabled(dex_name):
+                continue
+
+            if dex_name:
+                # builder-deployed perp dexs start at 110000, offset by 10000 each
+                self.gateway.perp_dex_to_offset[dex_name] = 110000 + (i - 1) * 10000
+            else:
+                self.gateway.perp_dex_to_offset[""] = 0
+
             self.gateway.perp_dexs.append(dex_name)
+
+        # Safety: keep at least default dex if user filtered out everything
+        if not self.gateway.perp_dexs:
+            self.gateway.write_log("Perp dex filter excluded all dexs, fallback to default dex")
+            self.gateway.perp_dexs = [""]
+            self.gateway.perp_dex_to_offset = {"": 0}
 
         self.gateway.write_log(f"Found perp dexs: {self.gateway.perp_dexs}")
 
@@ -907,6 +1023,39 @@ class WsApi(WebsocketClient):
         self.ticks: dict[str, TickData] = {}
         self.subscribed: dict[str, SubscribeRequest] = {}
 
+        # WS health state
+        self.last_recv_ts: float = time.time()
+        self.disconnected: bool = False
+
+    def restart(self) -> bool:
+        """
+        Restart websocket thread (best-effort).
+        Return True if a new thread is started, otherwise False.
+        """
+        if not self.host:
+            self.gateway.write_log("WebSocket restart skipped: host not initialized")
+            return False
+
+        # If previous thread still alive, try to close then join briefly
+        try:
+            if self.thread and self.thread.is_alive():
+                self.stop()
+                self.thread.join(timeout=5)
+                if self.thread.is_alive():
+                    self.gateway.write_log("WebSocket restart skipped: previous thread still alive")
+                    return False
+        except Exception as e:
+            self.gateway.write_log(f"WebSocket restart join error: {e}")
+
+        # Start a fresh thread
+        try:
+            self.disconnected = False
+            self.start()
+            return True
+        except Exception as e:
+            self.gateway.write_log(f"WebSocket restart failed: {e}")
+            return False
+
     def connect(
         self,
         proxy_host: str,
@@ -944,6 +1093,8 @@ class WsApi(WebsocketClient):
 
     def on_connected(self) -> None:
         self.gateway.write_log("WebSocket API connected")
+        self.disconnected = False
+        self.last_recv_ts = time.time()
 
         # Subscribe to user events
         if self.gateway.wallet:
@@ -969,15 +1120,20 @@ class WsApi(WebsocketClient):
         self.gateway.rest_api.query_position()
 
     def on_disconnected(self, status_code: int, msg: str) -> None:
-        self.gateway.write_log("WebSocket API disconnected")
-        self.wsapp = None
+        self.disconnected = True
+        self.gateway.write_log(f"WebSocket API disconnected: {status_code} {msg}")
 
     def on_packet(self, packet: dict) -> None:
         channel = packet.get("channel", "")
 
         if channel == "pong":
+            self.last_recv_ts = time.time()
             return
-        elif channel == "l2Book":
+
+        # Any non-pong packet counts as received data for heartbeat
+        self.last_recv_ts = time.time()
+
+        if channel == "l2Book":
             self.on_l2book(packet)
         elif channel == "trades":
             self.on_trades(packet)

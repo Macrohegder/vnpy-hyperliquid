@@ -9,6 +9,8 @@ Hyperliquid 交易所的 VeighNa (vn.py) 网关插件，支持永续合约 (Perp
 - **安全的撤单机制**: 使用 `cancelByCloid` 避免 oid 映射竞态条件
 - **重复成交去重**: 通过 `filled_tids` 集合处理 `userEvents` 和 `userFills` 双通道重复推送
 - **符号命名避冲**: `{name}_SWAP_HL` 格式避免与其他网关 `vt_symbol` 冲突
+- **断线自愈**: WebSocket 断线/卡死自动重启（心跳超时检测 + 退避重连）
+- **DEX/账号过滤**: 可按 builder perp dex（表现为多个 `USDC_XXX` 账户）做 include/exclude/regex 过滤，减少不需要的“子账号”加载
 
 ## 安装
 
@@ -37,6 +39,11 @@ setting = {
     "Private Key": "你的私钥",
     "Proxy Host": "",
     "Proxy Port": 0,
+    # 可选：过滤 builder perp dexs（影响：合约、账户、持仓、订单订阅都只加载筛选后的 dex）
+    # 说明：default 表示标准 dex（dex=""）；不填则加载全部
+    "Perp Dex Include": "",   # e.g. "default,xyz"
+    "Perp Dex Exclude": "",   # e.g. "test,abc"
+    "Perp Dex Regex": "",     # e.g. "^(default|prod_.*)$"
 }
 main_engine.connect(setting, "HYPERLIQUID")
 ```
