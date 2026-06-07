@@ -147,6 +147,34 @@ class HyperliquidGateway(BaseGateway):
         "Private Key": "",
         "Proxy Host": "",
         "Proxy Port": 0,
+        # Account publishing:
+        # - full: publish every perp dex account (USDC, USDC_XYZ, ...) + any enabled aggregates
+        # - minimal: only publish 3 accounts: XYZ + PERPS + SPOT (recommended for UI clarity)
+        "Account Publish Mode": "full",   # "full" or "minimal"
+        "Minimal XYZ AccountId": "XYZ",
+        "Minimal PERPS AccountId": "PERPS",
+        "Minimal SPOT AccountId": "SPOT",
+        # Market data subscriptions
+        # Note: l2Book is the heaviest channel. If you don't need bid/ask depth, disable it to reduce CPU.
+        "Subscribe L2Book": True,
+        "Subscribe Trades": True,
+        "Subscribe ActiveAssetCtx": True,
+        # Tick event throttling (align with okx-style consolidated tick push)
+        # 0 means no throttling (NOT recommended).
+        "Tick Push Interval (ms)": 200,
+        # Account aggregation
+        # If enabled, query clearinghouseState across ALL perp dexs (including filtered-out ones)
+        # and publish an extra AccountData with summed balance/available.
+        # Warning: if you have many builder dexs, this will increase REST requests.
+        "Aggregate All Perp Dex Accounts": False,
+        "Aggregate AccountId": "USDC_TOTAL",
+        # Total equity aggregation (align with HL UI "total account value", including unrealized PnL)
+        # This aggregates:
+        # 1) Perp: sum of clearinghouseState.marginSummary.accountValue across all perp dexs
+        # 2) Spot: value of spotClearinghouseState balances marked by spotMetaAndAssetCtxs markPx (USDC=1)
+        # Note: This is still "trading account" equity. Vaults/custody outside clearinghouse/spot are not included.
+        "Aggregate Total Equity": False,
+        "Aggregate Equity AccountId": "EQUITY_TOTAL",
         # DEX/account filtering (builder-deployed perp dexs)
         # - "default" represents the standard Hyperliquid perp dex (dex="")
         # - empty string means "no filter" (load all dexs)
@@ -190,6 +218,7 @@ class HyperliquidGateway(BaseGateway):
 
         # Perp dex support
         self.perp_dexs: list[str] = []
+        self.all_perp_dexs: list[str] = []
         self.perp_dex_to_offset: dict[str, int] = {}
         self.name_to_dex: dict[str, str] = {}
 
@@ -200,6 +229,24 @@ class HyperliquidGateway(BaseGateway):
         self.ping_interval: int = 20
 
         self.subscribed_symbols: set[str] = set()
+
+        # Market data behavior
+        self.subscribe_l2book: bool = True
+        self.subscribe_trades: bool = True
+        self.subscribe_active_asset_ctx: bool = True
+        self.tick_push_interval_ms: int = 200
+
+        # Account publishing behavior
+        self.account_publish_mode: str = "full"
+        self.minimal_xyz_accountid: str = "XYZ"
+        self.minimal_perps_accountid: str = "PERPS"
+        self.minimal_spot_accountid: str = "SPOT"
+
+        # Account aggregation behavior
+        self.aggregate_all_perp_dex_accounts: bool = False
+        self.aggregate_accountid: str = "USDC_TOTAL"
+        self.aggregate_total_equity: bool = False
+        self.aggregate_equity_accountid: str = "EQUITY_TOTAL"
 
         # DEX filtering
         self.perp_dex_include: set[str] = set()
@@ -272,6 +319,32 @@ class HyperliquidGateway(BaseGateway):
         self.private_key = setting["Private Key"]
         self.proxy_host = setting["Proxy Host"]
         self.proxy_port = setting["Proxy Port"]
+
+        # Account publishing settings
+        self.account_publish_mode = str(setting.get("Account Publish Mode", "full") or "full").strip().lower()
+        if self.account_publish_mode not in ("full", "minimal"):
+            self.account_publish_mode = "full"
+        self.minimal_xyz_accountid = (setting.get("Minimal XYZ AccountId") or "XYZ").strip() or "XYZ"
+        self.minimal_perps_accountid = (setting.get("Minimal PERPS AccountId") or "PERPS").strip() or "PERPS"
+        self.minimal_spot_accountid = (setting.get("Minimal SPOT AccountId") or "SPOT").strip() or "SPOT"
+
+        # Market data settings
+        self.subscribe_l2book = bool(setting.get("Subscribe L2Book", True))
+        self.subscribe_trades = bool(setting.get("Subscribe Trades", True))
+        self.subscribe_active_asset_ctx = bool(setting.get("Subscribe ActiveAssetCtx", True))
+        try:
+            self.tick_push_interval_ms = int(setting.get("Tick Push Interval (ms)", 200) or 0)
+            if self.tick_push_interval_ms < 0:
+                self.tick_push_interval_ms = 0
+        except Exception:
+            self.tick_push_interval_ms = 200
+
+        # Account aggregation settings
+        self.aggregate_all_perp_dex_accounts = bool(setting.get("Aggregate All Perp Dex Accounts", False))
+        self.aggregate_accountid = (setting.get("Aggregate AccountId") or "USDC_TOTAL").strip() or "USDC_TOTAL"
+        self.aggregate_total_equity = bool(setting.get("Aggregate Total Equity", False))
+        self.aggregate_equity_accountid = (setting.get("Aggregate Equity AccountId") or "EQUITY_TOTAL").strip() or "EQUITY_TOTAL"
+
         self._load_dex_filter_setting(setting)
 
         # Init wallet
@@ -468,6 +541,19 @@ class RestApi(RestClient):
         self._pending_dex_count: int = 0
         self._dex_contracts_ready: int = 0
 
+        # Account query aggregation across all dexs
+        self._pending_account_dex_count: int = 0
+        self._account_queries_ready: int = 0
+        self._account_by_dex: dict[str, AccountData] = {}
+
+        # Total equity aggregation (perp + spot)
+        self._spot_prices_ready: bool = False
+        self._spot_balances_ready: bool = False
+        self._spot_token_to_pair: dict[str, str] = {}   # token symbol -> spot pair coin string
+        self._spot_pair_mark_px: dict[str, float] = {}  # spot pair coin string -> markPx
+        self._spot_balances: dict[str, float] = {}      # coin symbol -> total
+        self._minimal_accounts_published: bool = False
+
     def connect(
         self,
         wallet: LocalAccount,
@@ -545,7 +631,26 @@ class RestApi(RestClient):
         if not self.wallet:
             return
         # Query account for each dex
-        for dex_name in self.gateway.perp_dexs:
+        # - In minimal publish mode, we must query ALL perp dexs so PERPS account is complete.
+        # - If any aggregation is enabled, query ALL perp dexs.
+        target_dexs: list[str]
+        need_all_dexs: bool = (
+            self.gateway.account_publish_mode == "minimal"
+            or self.gateway.aggregate_all_perp_dex_accounts
+            or self.gateway.aggregate_total_equity
+        )
+
+        if need_all_dexs and self.gateway.all_perp_dexs:
+            target_dexs = self.gateway.all_perp_dexs
+        else:
+            target_dexs = self.gateway.perp_dexs
+
+        self._pending_account_dex_count = len(target_dexs)
+        self._account_queries_ready = 0
+        self._account_by_dex.clear()
+        self._minimal_accounts_published = False
+
+        for dex_name in target_dexs:
             self.add_request(
                 method="POST",
                 path="/info",
@@ -553,6 +658,32 @@ class RestApi(RestClient):
                 headers={"Content-Type": "application/json"},
                 callback=self.on_query_account,
                 extra=dex_name,
+            )
+
+        # In minimal publish mode OR total-equity mode, we need spot balances + mark prices
+        if self.gateway.account_publish_mode == "minimal" or self.gateway.aggregate_total_equity:
+            self._spot_prices_ready = False
+            self._spot_balances_ready = False
+            self._spot_token_to_pair.clear()
+            self._spot_pair_mark_px.clear()
+            self._spot_balances.clear()
+
+            # 1) Spot balances (token totals)
+            self.add_request(
+                method="POST",
+                path="/info",
+                data=json.dumps({"type": "spotClearinghouseState", "user": self.wallet.address}),
+                headers={"Content-Type": "application/json"},
+                callback=self.on_query_spot_balances,
+            )
+
+            # 2) Spot mark prices (pair markPx)
+            self.add_request(
+                method="POST",
+                path="/info",
+                data=json.dumps({"type": "spotMetaAndAssetCtxs"}),
+                headers={"Content-Type": "application/json"},
+                callback=self.on_query_spot_meta_and_asset_ctxs,
             )
 
     def query_position(self) -> None:
@@ -763,6 +894,15 @@ class RestApi(RestClient):
             self.gateway.write_log("Invalid perpDexs response")
             return
 
+        # Keep a copy of all dexs returned by API ("" stands for default dex)
+        all_dexs: list[str] = []
+        for dex_info in packet:
+            if dex_info is None:
+                all_dexs.append("")
+            else:
+                all_dexs.append(dex_info.get("name", "") or "")
+        self.gateway.all_perp_dexs = all_dexs
+
         self.gateway.perp_dexs = []
         self.gateway.perp_dex_to_offset = {}
 
@@ -886,9 +1026,18 @@ class RestApi(RestClient):
         margin_summary = packet.get("marginSummary") or {}
         withdrawable = packet.get("withdrawable", "0") or "0"
 
-        accountid: str = "USDC" if not dex_name else f"USDC_{dex_name.upper()}"
+        accountid: str
+        if self.gateway.account_publish_mode == "minimal":
+            # Only keep XYZ as a standalone account in UI
+            if (dex_name or "").strip().lower() == "xyz":
+                accountid = self.gateway.minimal_xyz_accountid
+            else:
+                accountid = ""   # not published
+        else:
+            accountid = "USDC" if not dex_name else f"USDC_{dex_name.upper()}"
+
         account: AccountData = AccountData(
-            accountid=accountid,
+            accountid=accountid or "HIDDEN",
             balance=get_float_value(margin_summary, "accountValue"),
             gateway_name=self.gateway_name,
         )
@@ -896,7 +1045,266 @@ class RestApi(RestClient):
         account.frozen = account.balance - account.available
 
         self.gateway.write_log(f"Account query [{dex_name or 'default'}]: balance={account.balance}, available={account.available}")
-        self.gateway.on_account(account)
+        if accountid:
+            self.gateway.on_account(account)
+
+        # Track and publish aggregated account if enabled
+        if self.gateway.aggregate_all_perp_dex_accounts:
+            self._account_by_dex[dex_name] = account
+            self._account_queries_ready += 1
+
+            if self._pending_account_dex_count > 0 and self._account_queries_ready >= self._pending_account_dex_count:
+                total_balance: float = 0.0
+                total_available: float = 0.0
+                total_frozen: float = 0.0
+
+                for a in self._account_by_dex.values():
+                    total_balance += float(a.balance or 0)
+                    total_available += float(getattr(a, "available", 0) or 0)
+                    total_frozen += float(getattr(a, "frozen", 0) or 0)
+
+                total_accountid: str = self.gateway.aggregate_accountid or "USDC_TOTAL"
+                total: AccountData = AccountData(
+                    accountid=total_accountid,
+                    balance=total_balance,
+                    gateway_name=self.gateway_name,
+                )
+                total.available = total_available
+                # Prefer summing each dex frozen, fallback to balance-available
+                total.frozen = total_frozen if total_frozen > 0 else (total_balance - total_available)
+
+                self.gateway.write_log(
+                    f"Account aggregate [{total_accountid}]: balance={total.balance}, available={total.available}"
+                )
+                self.gateway.on_account(total)
+
+        # Always track progress for minimal mode / total equity publishing
+        if self.gateway.account_publish_mode == "minimal" and dex_name not in self._account_by_dex:
+            self._account_by_dex[dex_name] = account
+            self._account_queries_ready += 1
+        elif not self.gateway.aggregate_all_perp_dex_accounts:
+            # In non-aggregation mode we still need to advance readiness for minimal/total equity checks
+            self._account_by_dex[dex_name] = account
+            self._account_queries_ready += 1
+
+        # Try publishing minimal accounts / total equity when all required parts are ready
+        if self.gateway.account_publish_mode == "minimal":
+            self._try_publish_minimal_accounts()
+        elif self.gateway.aggregate_total_equity:
+            self._try_publish_total_equity()
+
+    def on_query_spot_balances(self, packet: dict, request: Request) -> None:
+        """Callback of spotClearinghouseState (spot token balances)."""
+        if not isinstance(packet, dict):
+            return
+
+        balances = packet.get("balances", []) or []
+        if not isinstance(balances, list):
+            balances = []
+
+        for b in balances:
+            if not isinstance(b, dict):
+                continue
+            coin = b.get("coin", "") or ""
+            total_str = b.get("total", "0") or "0"
+            try:
+                total = float(total_str)
+            except Exception:
+                total = 0.0
+            if coin:
+                self._spot_balances[coin] = total
+
+        self._spot_balances_ready = True
+        if self.gateway.account_publish_mode == "minimal":
+            self._try_publish_minimal_accounts()
+        else:
+            self._try_publish_total_equity()
+
+    def on_query_spot_meta_and_asset_ctxs(self, packet: dict, request: Request) -> None:
+        """Callback of spotMetaAndAssetCtxs (spot metadata + mark prices)."""
+        # Expected schema: [spotMeta, assetCtxs]
+        if not isinstance(packet, list) or len(packet) < 2:
+            self.gateway.write_log("Invalid spotMetaAndAssetCtxs response")
+            self._spot_prices_ready = True
+            self._try_publish_total_equity()
+            return
+
+        spot_meta = packet[0] or {}
+        asset_ctxs = packet[1] or []
+
+        universe = spot_meta.get("universe", []) if isinstance(spot_meta, dict) else []
+        tokens = spot_meta.get("tokens", []) if isinstance(spot_meta, dict) else []
+
+        # Build token name -> token index
+        token_name_to_index: dict[str, int] = {}
+        if isinstance(tokens, list):
+            for t in tokens:
+                if not isinstance(t, dict):
+                    continue
+                name = (t.get("name") or "").strip()
+                idx = t.get("index")
+                if name and isinstance(idx, int):
+                    token_name_to_index[name] = idx
+
+        # Build base token index -> pair coin string (quote must be USDC token 0)
+        base_index_to_pair: dict[int, str] = {}
+        if isinstance(universe, list):
+            for u in universe:
+                if not isinstance(u, dict):
+                    continue
+                pair_name = u.get("name", "") or ""
+                pair_tokens = u.get("tokens", [])
+                if not pair_name or not isinstance(pair_tokens, list) or len(pair_tokens) != 2:
+                    continue
+                base_token, quote_token = pair_tokens[0], pair_tokens[1]
+                if isinstance(base_token, int) and quote_token == 0:
+                    # Map base token index -> coin string used by APIs ("PURR/USDC" or "@{index}")
+                    base_index_to_pair[base_token] = pair_name
+
+        # Now map token symbol -> pair coin string
+        self._spot_token_to_pair.clear()
+        for sym, idx in token_name_to_index.items():
+            pair = base_index_to_pair.get(idx)
+            if pair:
+                self._spot_token_to_pair[sym] = pair
+
+        # Map pair coin string -> markPx (zip by universe order)
+        self._spot_pair_mark_px.clear()
+        if isinstance(universe, list) and isinstance(asset_ctxs, list):
+            n = min(len(universe), len(asset_ctxs))
+            for i in range(n):
+                u = universe[i]
+                c = asset_ctxs[i]
+                if not isinstance(u, dict) or not isinstance(c, dict):
+                    continue
+                pair_name = u.get("name", "") or ""
+                if not pair_name:
+                    continue
+                try:
+                    mark_px = float(c.get("markPx", 0) or 0)
+                except Exception:
+                    mark_px = 0.0
+                if mark_px:
+                    self._spot_pair_mark_px[pair_name] = mark_px
+
+        self._spot_prices_ready = True
+        if self.gateway.account_publish_mode == "minimal":
+            self._try_publish_minimal_accounts()
+        else:
+            self._try_publish_total_equity()
+
+    def _try_publish_total_equity(self) -> None:
+        """Publish a synthetic AccountData that approximates HL UI total equity (perp + spot MTM)."""
+        # Need: all perp dex account queries completed + spot balances + spot prices
+        if self._pending_account_dex_count <= 0:
+            return
+        if self._account_queries_ready < self._pending_account_dex_count:
+            return
+        if not (self._spot_balances_ready and self._spot_prices_ready):
+            return
+
+        # 1) Perp equity: sum of each dex marginSummary.accountValue (already includes unrealized PnL)
+        perp_equity: float = 0.0
+        for a in self._account_by_dex.values():
+            perp_equity += float(a.balance or 0)
+
+        # 2) Spot equity: sum of token totals marked to USDC using spot markPx
+        spot_equity: float = 0.0
+        for coin, total in self._spot_balances.items():
+            if not coin:
+                continue
+            if coin.upper() == "USDC":
+                spot_equity += float(total)
+                continue
+            pair = self._spot_token_to_pair.get(coin)
+            if not pair:
+                continue
+            px = self._spot_pair_mark_px.get(pair, 0.0)
+            if px:
+                spot_equity += float(total) * float(px)
+
+        total_equity: float = perp_equity + spot_equity
+
+        accountid: str = self.gateway.aggregate_equity_accountid or "EQUITY_TOTAL"
+        total: AccountData = AccountData(
+            accountid=accountid,
+            balance=total_equity,
+            gateway_name=self.gateway_name,
+        )
+        # available/frozen are not well-defined for total equity across perps+spot; keep them equal to balance/0
+        total.available = total_equity
+        total.frozen = 0.0
+
+        self.gateway.write_log(
+            f"Equity aggregate [{accountid}]: total={total.balance} (perp={perp_equity}, spot≈{spot_equity})"
+        )
+        self.gateway.on_account(total)
+
+    def _try_publish_minimal_accounts(self) -> None:
+        """
+        Publish only 3 accounts for UI:
+        - XYZ: the standalone dex account (published in on_query_account)
+        - PERPS: sum of perp equity across all perp dexs
+        - SPOT: spot balances marked to USDC using spot markPx
+        """
+        if self._minimal_accounts_published:
+            return
+        if self._pending_account_dex_count <= 0:
+            return
+        if self._account_queries_ready < self._pending_account_dex_count:
+            return
+        if not (self._spot_balances_ready and self._spot_prices_ready):
+            return
+
+        # PERPS equity: sum of each dex marginSummary.accountValue (includes unrealized PnL)
+        perp_equity: float = 0.0
+        perp_available: float = 0.0
+        perp_frozen: float = 0.0
+        for a in self._account_by_dex.values():
+            perp_equity += float(a.balance or 0)
+            perp_available += float(getattr(a, "available", 0) or 0)
+            perp_frozen += float(getattr(a, "frozen", 0) or 0)
+
+        perps_id: str = self.gateway.minimal_perps_accountid or "PERPS"
+        perps: AccountData = AccountData(
+            accountid=perps_id,
+            balance=perp_equity,
+            gateway_name=self.gateway_name,
+        )
+        perps.available = perp_available
+        perps.frozen = perp_frozen if perp_frozen > 0 else (perp_equity - perp_available)
+        self.gateway.on_account(perps)
+
+        # SPOT equity: sum of token totals marked to USDC using spot markPx
+        spot_equity: float = 0.0
+        for coin, total in self._spot_balances.items():
+            if not coin:
+                continue
+            if coin.upper() == "USDC":
+                spot_equity += float(total)
+                continue
+            pair = self._spot_token_to_pair.get(coin)
+            if not pair:
+                continue
+            px = self._spot_pair_mark_px.get(pair, 0.0)
+            if px:
+                spot_equity += float(total) * float(px)
+
+        spot_id: str = self.gateway.minimal_spot_accountid or "SPOT"
+        spot: AccountData = AccountData(
+            accountid=spot_id,
+            balance=spot_equity,
+            gateway_name=self.gateway_name,
+        )
+        # available/frozen not well-defined; keep simple
+        spot.available = spot_equity
+        spot.frozen = 0.0
+        self.gateway.on_account(spot)
+
+        self.gateway.write_log(
+            f"Minimal accounts published: {self.gateway.minimal_xyz_accountid}, {perps_id}, {spot_id}"
+        )
+        self._minimal_accounts_published = True
 
     def on_query_position(self, packet: dict, request: Request) -> None:
         """Callback of position query."""
@@ -1023,6 +1431,9 @@ class WsApi(WebsocketClient):
         self.ticks: dict[str, TickData] = {}
         self.subscribed: dict[str, SubscribeRequest] = {}
 
+        # Tick push throttling (per symbol)
+        self._last_tick_push_ms: dict[str, int] = {}
+
         # WS health state
         self.last_recv_ts: float = time.time()
         self.disconnected: bool = False
@@ -1077,19 +1488,42 @@ class WsApi(WebsocketClient):
         self.ticks[req.symbol] = tick
         self.subscribed[req.symbol] = req
 
-        # Subscribe to l2Book and trades
-        self.send_packet({
-            "method": "subscribe",
-            "subscription": {"type": "l2Book", "coin": contract.name},
-        })
-        self.send_packet({
-            "method": "subscribe",
-            "subscription": {"type": "trades", "coin": contract.name},
-        })
-        self.send_packet({
-            "method": "subscribe",
-            "subscription": {"type": "activeAssetCtx", "coin": contract.name},
-        })
+        # Subscribe market data channels
+        if self.gateway.subscribe_l2book:
+            self.send_packet({
+                "method": "subscribe",
+                "subscription": {"type": "l2Book", "coin": contract.name},
+            })
+        if self.gateway.subscribe_trades:
+            self.send_packet({
+                "method": "subscribe",
+                "subscription": {"type": "trades", "coin": contract.name},
+            })
+        if self.gateway.subscribe_active_asset_ctx:
+            self.send_packet({
+                "method": "subscribe",
+                "subscription": {"type": "activeAssetCtx", "coin": contract.name},
+            })
+
+    def _push_tick(self, symbol: str) -> None:
+        """
+        Consolidate and throttle tick pushing (align with okx-style behavior).
+        Websocket channels can be very frequent; pushing every packet will flood EventEngine.
+        """
+        tick: TickData | None = self.ticks.get(symbol)
+        if not tick:
+            return
+
+        interval_ms: int = int(getattr(self.gateway, "tick_push_interval_ms", 200) or 0)
+        if interval_ms > 0:
+            now_ms: int = int(time.time() * 1000)
+            last_ms: int = self._last_tick_push_ms.get(symbol, 0)
+            if now_ms - last_ms < interval_ms:
+                return
+            self._last_tick_push_ms[symbol] = now_ms
+
+        tick.datetime = datetime.now(CHINA_TZ)
+        self.gateway.on_tick(copy(tick))
 
     def on_connected(self) -> None:
         self.gateway.write_log("WebSocket API connected")
@@ -1195,8 +1629,7 @@ class WsApi(WebsocketClient):
             tick.__setattr__(f"ask_price_{n + 1}", price)
             tick.__setattr__(f"ask_volume_{n + 1}", size)
 
-        tick.datetime = datetime.now(CHINA_TZ)
-        self.gateway.on_tick(copy(tick))
+        self._push_tick(contract.symbol)
 
     def on_trades(self, packet: dict) -> None:
         data = packet.get("data", [])
@@ -1215,8 +1648,7 @@ class WsApi(WebsocketClient):
 
         tick.last_price = float(trade.get("px", 0))
         tick.last_volume = float(trade.get("sz", 0))
-        tick.datetime = datetime.now(CHINA_TZ)
-        self.gateway.on_tick(copy(tick))
+        self._push_tick(contract.symbol)
 
     def on_active_asset_ctx(self, packet: dict) -> None:
         data = packet.get("data", {})
@@ -1234,8 +1666,7 @@ class WsApi(WebsocketClient):
         tick.open_price = get_float_value(ctx, "prevDayPx")
         tick.volume = get_float_value(ctx, "dayBaseVlm")
         tick.turnover = get_float_value(ctx, "dayNtlVlm")
-        tick.datetime = datetime.now(CHINA_TZ)
-        self.gateway.on_tick(copy(tick))
+        self._push_tick(contract.symbol)
 
     def on_user_events(self, packet: dict) -> None:
         data = packet.get("data", {})
